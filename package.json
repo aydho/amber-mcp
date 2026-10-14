@@ -1,0 +1,20 @@
+{
+  "name": "amber-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "netlify dev"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@netlify/blobs": "^11.1.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^6.0.2",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}
