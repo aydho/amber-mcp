@@ -4,6 +4,8 @@ import { AmberError, amberClient } from "./amber.js";
 import { amberKeyValid } from "./oauth.js";
 import { DEFAULT_TZ, STATE_TZ, checkTz, localDay, localHour, parseTime, pick, round, toLocal } from "./format.js";
 
+export const VERSION = "0.4.0";
+
 export interface AuthContext {
   apiKey: string;
   method: "oauth" | "api_key";
@@ -16,11 +18,17 @@ const siteId = z.string().optional().describe("Amber site id; defaults to the on
 const channel = z
   .enum(["all", "general", "controlledLoad", "feedIn"])
   .default("all")
-  .describe("Filter to one channel (general = buy, controlledLoad = off-peak, feedIn = solar export)");
+  .describe("Filter to one channel. Only channels on your site are returned (general = buy; controlledLoad and feedIn exist only if you have them)");
 const timezone = z
   .string()
   .optional()
   .describe(`IANA timezone for returned times (default ${DEFAULT_TZ}); offsets reflect daylight saving`);
+const detail = z
+  .enum(["compact", "full"])
+  .default("compact")
+  .describe(
+    "compact: key fields plus spikeStatus (only when not 'none') and forecast low/high; full: also spotPerKwh, descriptor, forecast predicted, tariff period",
+  );
 const aggregate = z
   .enum(["none", "hourly", "daily"])
   .default("none")
@@ -52,35 +60,46 @@ const matches = (r: Row, ch: string) => ch === "all" || r.channelType === ch;
 const byStart = (a: Row, b: Row) => String(a.startTime).localeCompare(String(b.startTime));
 const kind = (t: string) => (t === "ActualInterval" ? "actual" : t === "CurrentInterval" ? "current" : "forecast");
 
-const PRICE_FIELDS = ["start", "end", "channel", "type", "perKwh", "spotPerKwh", "renewables", "descriptor", "spikeStatus"] as const;
-const PRICE_DEFAULT = ["start", "end", "channel", "type", "perKwh", "renewables"];
+const PRICE_FIELDS = ["start", "end", "channel", "type", "perKwh", "spotPerKwh", "renewables", "descriptor", "spikeStatus", "low", "predicted", "high", "tariffPeriod"] as const;
+const PRICE_DEFAULT = ["start", "end", "channel", "type", "perKwh", "renewables", "spikeStatus", "low", "high"];
+const PRICE_FULL = [...PRICE_DEFAULT, "spotPerKwh", "descriptor", "predicted", "tariffPeriod"];
 
-function shapePrices(rows: Row[], o: { channel: string; tz: string; aggregate: string; fields?: readonly string[] }) {
+function shapePrices(rows: Row[], o: { channel: string; tz: string; aggregate: string; detail: string; fields?: readonly string[] }) {
   const list = rows.filter((r) => matches(r, o.channel)).sort(byStart);
   if (o.aggregate === "none") {
-    return list.map((r) =>
-      pick(
-        {
-          start: toLocal(r.startTime, o.tz),
-          end: toLocal(r.endTime, o.tz),
-          channel: r.channelType,
-          type: kind(r.type),
-          perKwh: round(r.perKwh),
-          spotPerKwh: round(r.spotPerKwh),
-          renewables: round(r.renewables, 1),
-          descriptor: r.descriptor,
-          spikeStatus: r.spikeStatus,
-        },
-        o.fields ?? PRICE_DEFAULT,
-      ),
-    );
+    return list.map((r) => {
+      const adv = r.advancedPrice ?? {};
+      const row = {
+        start: toLocal(r.startTime, o.tz),
+        end: toLocal(r.endTime, o.tz),
+        channel: r.channelType,
+        type: kind(r.type),
+        perKwh: round(r.perKwh),
+        spotPerKwh: round(r.spotPerKwh),
+        renewables: round(r.renewables, 1),
+        descriptor: r.descriptor,
+        spikeStatus: r.spikeStatus,
+        low: round(adv.low),
+        predicted: round(adv.predicted),
+        high: round(adv.high),
+        tariffPeriod: r.tariffInformation?.period,
+      };
+      const out = pick(row, o.fields ?? (o.detail === "full" ? PRICE_FULL : PRICE_DEFAULT)) as Row;
+      // sparse by default: drop spikeStatus "none" and absent forecast bands unless explicitly requested
+      if (!o.fields) {
+        if (out.spikeStatus === "none" || out.spikeStatus == null) delete out.spikeStatus;
+        for (const k of ["low", "high", "predicted"]) if (out[k] == null) delete out[k];
+      }
+      return out;
+    });
   }
-  const buckets = new Map<string, { channel: string; start: string; vals: number[]; ren: number[] }>();
+  const buckets = new Map<string, { channel: string; start: string; vals: number[]; ren: number[]; spikes: number }>();
   for (const r of list) {
     const local = toLocal(r.startTime, o.tz);
     const start = o.aggregate === "hourly" ? localHour(local) : localDay(local);
     const k = r.channelType + "|" + start;
-    const b: { channel: string; start: string; vals: number[]; ren: number[] } = buckets.get(k) ?? { channel: r.channelType, start, vals: [], ren: [] };
+    const b: { channel: string; start: string; vals: number[]; ren: number[]; spikes: number } = buckets.get(k) ?? { channel: r.channelType, start, vals: [], ren: [], spikes: 0 };
+    if (r.spikeStatus && r.spikeStatus !== "none") b.spikes++;
     b.vals.push(r.perKwh);
     if (typeof r.renewables === "number") b.ren.push(r.renewables);
     buckets.set(k, b);
@@ -93,19 +112,25 @@ function shapePrices(rows: Row[], o: { channel: string; tz: string; aggregate: s
     minPerKwh: round(Math.min(...b.vals)),
     maxPerKwh: round(Math.max(...b.vals)),
     ...(b.ren.length ? { avgRenewables: round(avg(b.ren), 1) } : {}),
+    ...(b.spikes ? { spikeIntervals: b.spikes } : {}),
     intervals: b.vals.length,
   }));
 }
 
 const USAGE_FIELDS = ["start", "end", "channel", "channelId", "kwh", "costCents", "perKwh", "quality", "renewables", "spotPerKwh"] as const;
 const USAGE_DEFAULT = ["start", "end", "channel", "kwh", "costCents", "perKwh", "quality"];
-/** Consecutive zero-kWh intervals on the buy channel that look like missing meter data (6 x 30min = 3h). */
-const GAP_RUN = 6;
+/** Default minimum run of consecutive zero-kWh buy-channel intervals to flag as a suspected meter gap (3 x 30min = 1.5h). */
+const GAP_RUN = 3;
+const inPeak = (local: string) => {
+  const h = +local.slice(11, 13);
+  return h >= 16 && h < 21;
+};
 
 function shapeUsage(
   rows: Row[],
-  o: { channel: string; tz: string; aggregate: string; includeZero: boolean; totalsOnly: boolean; fields?: readonly string[] },
+  o: { channel: string; tz: string; aggregate: string; includeZero: boolean; totalsOnly: boolean; gapRun: number; fields?: readonly string[] },
 ) {
+  const hasFeedIn = rows.some((r) => r.channelType === "feedIn");
   const list = rows.filter((r) => matches(r, o.channel)).sort(byStart);
 
   // totals + data quality per channel
@@ -137,24 +162,29 @@ function shapeUsage(
     if (zero === rs.length) warnings.push(`${name} recorded 0 kWh for every interval in this range.`);
     else if (rs[0].channelType === "general") {
       let run: Row[] = [];
-      const flush = () => {
-        if (run.length >= GAP_RUN)
+      const flush = (trailing = false) => {
+        if (run.length >= o.gapRun) {
+          const start = toLocal(run[0].startTime, o.tz);
           gaps.push({
             channel: rs[0].channelType,
-            start: toLocal(run[0].startTime, o.tz),
+            start,
             end: toLocal(run[run.length - 1].endTime, o.tz),
             intervals: run.length,
             labelledBillable: run.filter((r) => r.quality === "billable").length,
+            ...(inPeak(start) ? { duringEveningPeak: true } : {}),
+            ...(trailing ? { atEndOfData: true } : {}),
+            ...(hasFeedIn ? { possibleSolarSelfConsumption: true } : {}),
           });
+        }
         run = [];
       };
       for (const r of rs) (r.kwh ? flush() : run.push(r));
-      flush();
+      flush(true);
     }
   }
   if (gaps.length)
     warnings.push(
-      `${gaps.length} run(s) of ${GAP_RUN}+ consecutive zero-kWh intervals on the buy channel; this may be meter-data lag or a real gap even where quality says "billable". Treat those zeros as unverified.`,
+      `${gaps.length} run(s) of ${o.gapRun}+ consecutive zero-kWh intervals on the buy channel; this may be meter-data lag or a real gap even where quality says "billable". Treat those zeros as unverified.`,
     );
   const last = list.length ? toLocal(list[list.length - 1].endTime, o.tz) : null;
   const dataQuality = { dataThrough: last, suspectedGaps: gaps, warnings };
@@ -215,7 +245,7 @@ function shapeUsage(
 
 export function buildServer(auth: AuthContext): McpServer {
   const { get: amberGet, resolveSite } = amberClient(auth.apiKey);
-  const server = new McpServer({ name: "amber-mcp", version: "0.3.0" });
+  const server = new McpServer({ name: "amber-mcp", version: VERSION });
 
   server.registerTool(
     "get_auth_status",
@@ -225,7 +255,7 @@ export function buildServer(auth: AuthContext): McpServer {
       inputSchema: { check_with_amber: z.boolean().default(false).describe("Also confirm Amber still accepts the key") },
     },
     wrap(async ({ check_with_amber }) => {
-      const out: Row = { authenticated: true, method: auth.method };
+      const out: Row = { serverVersion: VERSION, authenticated: true, method: auth.method };
       if (auth.expiresAt) {
         const days = (auth.expiresAt - Date.now()) / 86_400_000;
         out.expiresAt = new Date(auth.expiresAt).toISOString();
@@ -247,29 +277,30 @@ export function buildServer(auth: AuthContext): McpServer {
     "get_current_prices",
     {
       description:
-        "Current price per channel in c/kWh (rounded to 2dp), optionally with forecast and past intervals. Times are local with correct DST offsets.",
+        "Current price per channel on your site in c/kWh (2dp), optionally with forecast and past intervals. Includes spikeStatus (when not 'none') and forecast low/high bands; detail=full adds spot price, descriptor and predicted. Times are local with correct DST offsets.",
       inputSchema: {
         site_id: siteId,
         channel,
         next: z.number().int().min(0).max(2048).default(0).describe("Forecast intervals to include"),
         previous: z.number().int().min(0).max(2048).default(0).describe("Past intervals to include"),
         aggregate,
+        detail,
         timezone,
-        fields: z.array(z.enum(PRICE_FIELDS)).optional().describe(`Fields to return (default: ${PRICE_DEFAULT.join(", ")})`),
+        fields: z.array(z.enum(PRICE_FIELDS)).optional().describe(`Explicit field list; overrides detail (default: ${PRICE_DEFAULT.join(", ")})`),
       },
     },
     wrap(async (a) => {
       const tz = tzOf(a.timezone);
       const id = await resolveSite(a.site_id);
       const rows = (await amberGet(`/sites/${id}/prices/current`, { next: a.next, previous: a.previous, resolution: 30 })) as Row[];
-      return { timezone: tz, prices: shapePrices(rows, { channel: a.channel, tz, aggregate: a.aggregate, fields: a.fields }) };
+      return { timezone: tz, prices: shapePrices(rows, { channel: a.channel, tz, aggregate: a.aggregate, detail: a.detail, fields: a.fields }) };
     }),
   );
 
   server.registerTool(
     "get_price_history",
     {
-      description: "Prices between two dates (inclusive). Use aggregate=hourly|daily and channel to keep responses small.",
+      description: "Historical prices between two dates (inclusive), c/kWh. Default is ~48 rows per channel per day; use channel and aggregate=hourly|daily to shrink it.",
       inputSchema: {
         site_id: siteId,
         start_date: date,
@@ -277,8 +308,9 @@ export function buildServer(auth: AuthContext): McpServer {
         resolution: z.union([z.literal(5), z.literal(30)]).default(30),
         channel,
         aggregate,
+        detail,
         timezone,
-        fields: z.array(z.enum(PRICE_FIELDS)).optional().describe(`Fields to return (default: ${PRICE_DEFAULT.join(", ")})`),
+        fields: z.array(z.enum(PRICE_FIELDS)).optional().describe(`Explicit field list; overrides detail (default: ${PRICE_DEFAULT.join(", ")})`),
       },
     },
     wrap(async (a) => {
@@ -289,7 +321,7 @@ export function buildServer(auth: AuthContext): McpServer {
         endDate: a.end_date,
         resolution: a.resolution,
       })) as Row[];
-      return { timezone: tz, prices: shapePrices(rows, { channel: a.channel, tz, aggregate: a.aggregate, fields: a.fields }) };
+      return { timezone: tz, prices: shapePrices(rows, { channel: a.channel, tz, aggregate: a.aggregate, detail: a.detail, fields: a.fields }) };
     }),
   );
 
@@ -304,6 +336,7 @@ export function buildServer(auth: AuthContext): McpServer {
         end_date: date,
         channel,
         aggregate,
+        gap_threshold_intervals: z.number().int().min(1).max(48).default(GAP_RUN).describe("Flag runs of at least this many consecutive zero-kWh buy-channel intervals as suspected meter gaps (30 min each)"),
         totals_only: z.boolean().default(false).describe("Return only totals and data quality, no rows"),
         include_zero: z.boolean().default(false).describe("Keep zero-kWh rows"),
         timezone,
@@ -323,6 +356,7 @@ export function buildServer(auth: AuthContext): McpServer {
         aggregate: a.aggregate,
         includeZero: a.include_zero,
         totalsOnly: a.totals_only,
+        gapRun: a.gap_threshold_intervals,
         fields: a.fields,
       });
     }),
@@ -331,7 +365,7 @@ export function buildServer(auth: AuthContext): McpServer {
   server.registerTool(
     "get_renewables",
     {
-      description: "Renewables percentage of the grid for a state (no API key needed). Times are local to the state.",
+      description: "Renewables percentage of the grid for a state (no API key needed): the current interval, plus past and forecast intervals via previous/next. Each row is typed actual/current/forecast; times are local to the state.",
       inputSchema: {
         state: z.enum(["nsw", "vic", "qld", "sa"]),
         next: z.number().int().min(0).max(2048).default(0),
