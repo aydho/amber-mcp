@@ -9,5 +9,5 @@
     "esModuleInterop": true,
     "types": ["node"]
   },
-  "include": ["src", "netlify"]
+  "include": ["src", "netlify", "test"]
 }

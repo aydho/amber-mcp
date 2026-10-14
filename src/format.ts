@@ -41,7 +41,7 @@ function parts(ms: number, tz: string): Record<string, string> & { off: string }
 }
 
 /** Round to the nearest minute, which removes Amber's ":00:01" interval-start quirk. */
-const roundMin = (iso: string) => Math.round(Date.parse(iso) / 60_000) * 60_000;
+export const roundMin = (iso: string) => Math.round(Date.parse(iso) / 60_000) * 60_000;
 
 /** ISO timestamp in the given zone with its real UTC offset (e.g. 2026-10-14T19:30:00+11:00). */
 export function toLocal(iso: string, tz: string): string {

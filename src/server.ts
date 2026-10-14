@@ -1,10 +1,23 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { AmberError, amberClient } from "./amber.js";
+import { AmberError, amberClient, type AmberClient } from "./amber.js";
 import { amberKeyValid } from "./oauth.js";
-import { DEFAULT_TZ, STATE_TZ, checkTz, clipToRange, localDay, localRange, localHour, parseTime, pick, round, toLocal } from "./format.js";
+import {
+  PRICES_MAX_CHUNK_DAYS,
+  USAGE_MAX_CHUNK_DAYS,
+  type ChunkFailure,
+  checkRange,
+  datesWithData,
+  dedupeRows,
+  eachDate,
+  failedDates,
+  failureWarning,
+  fetchChunks,
+  planChunks,
+} from "./chunk.js";
+import { DEFAULT_TZ, STATE_TZ, checkTz, clipToRange, localDay, localHour, parseTime, pick, round, toLocal } from "./format.js";
 
-export const VERSION = "0.5.2";
+export const VERSION = "0.6.0";
 
 export interface AuthContext {
   apiKey: string;
@@ -32,6 +45,7 @@ const aggregate = z
   .default("none")
   .describe("Collapse intervals into hourly or daily buckets (local time) to shrink the response. Buckets have a fixed shape, so fields (and detail) do not apply");
 
+type AmberGet = AmberClient["get"];
 const ok = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }] });
 const fail = (e: unknown) => ({
   isError: true,
@@ -129,9 +143,21 @@ const inPeak = (local: string) => {
   return h >= 16 && h < 21;
 };
 
-function shapeUsage(
+export function shapeUsage(
   rows: Row[],
-  o: { channel: string; tz: string; aggregate: string; includeZero: boolean; totalsOnly: boolean; gapRun: number; fields?: readonly string[] },
+  o: {
+    channel: string;
+    tz: string;
+    aggregate: string;
+    includeZero: boolean;
+    totalsOnly: boolean;
+    gapRun: number;
+    fields?: readonly string[];
+    /** requested local-date range, used for missingDays */
+    requested: { start: string; end: string };
+    failed?: ChunkFailure[];
+    chunkCount?: number;
+  },
 ) {
   const hasFeedIn = rows.some((r) => r.channelType === "feedIn");
   const list = rows.filter((r) => matches(r, o.channel)).sort(byStart);
@@ -190,7 +216,18 @@ function shapeUsage(
       `${gaps.length} run(s) of ${o.gapRun}+ consecutive zero-kWh intervals on the buy channel; this may be meter-data lag or a real gap even where quality says "billable". Treat those zeros as unverified.`,
     );
   const last = list.length ? toLocal(list[list.length - 1].endTime, o.tz) : null;
-  const dataQuality = { dataThrough: last, suspectedGaps: gaps, warnings };
+  const withData = datesWithData(rows, o.tz);
+  const failed = o.failed ?? [];
+  const failedSet = failedDates(failed);
+  if (failed.length) warnings.push(failureWarning(failed, o.chunkCount ?? failed.length));
+  const dataQuality = {
+    dataThrough: last,
+    dataFrom: [...withData].sort()[0] ?? null,
+    missingDays: eachDate(o.requested.start, o.requested.end).filter((d) => !withData.has(d) && !failedSet.has(d)),
+    suspectedGaps: gaps,
+    warnings,
+    ...(failed.length ? { failedRanges: failed } : {}),
+  };
 
   const head = { timezone: o.tz, totals, dataQuality };
   if (o.totalsOnly) return head;
@@ -244,6 +281,28 @@ function shapeUsage(
         intervals: b.n,
       })),
   };
+}
+
+/** Wall-clock budget for one tool call's Amber fetching; keeps us inside the Netlify function timeout (10s default). */
+const FETCH_BUDGET_MS = Number(process.env.AMBER_FETCH_BUDGET_MS) || 8_000;
+
+/**
+ * Fetch an inclusive local-date range in chunks Amber accepts, clip each to its local-midnight window, and merge/dedupe.
+ * Failed windows are returned, not thrown, unless every window failed.
+ */
+export async function fetchWindowed(
+  amberGet: AmberGet,
+  path: string,
+  query: Record<string, string | number | undefined>,
+  o: { start: string; end: string; tz: string; maxDays: number; startedAt: number },
+) {
+  const chunks = planChunks(o.start, o.end, o.tz, o.maxDays);
+  const { rows, failed } = await fetchChunks(
+    chunks,
+    async (c, signal) => clipToRange((await amberGet(path, { ...query, startDate: c.range.nemStart, endDate: c.range.nemEnd }, { signal })) as Row[], c.range),
+    { deadline: o.startedAt + FETCH_BUDGET_MS },
+  );
+  return { rows: dedupeRows(rows), failed, chunkCount: chunks.length };
 }
 
 export function buildServer(auth: AuthContext): McpServer {
@@ -326,7 +385,7 @@ export function buildServer(auth: AuthContext): McpServer {
   server.registerTool(
     "get_price_history",
     {
-      description: "Historical prices between two local dates (inclusive, aligned to local midnights), c/kWh. Default is ~48 rows per channel per day; use channel and aggregate=hourly|daily to shrink it.",
+      description: "Historical prices between two local dates (inclusive, aligned to local midnights), c/kWh. Maximum range is 90 days; ranges over 7 days are fetched in 7-day chunks and merged into one response (slower, so prefer aggregate=daily or hourly for long ranges). If a chunk fails, the rest is returned with failedRanges and a warning. Default is ~48 rows per channel per day; use channel and aggregate=hourly|daily to shrink it.",
       inputSchema: {
         site_id: siteId,
         start_date: date,
@@ -341,18 +400,22 @@ export function buildServer(auth: AuthContext): McpServer {
     },
     wrap(async (a) => {
       noFieldsWithAggregate(a.fields, a.aggregate);
+      const startedAt = Date.now();
       const tz = tzOf(a.timezone);
+      checkRange(a.start_date, a.end_date);
       const id = await resolveSite(a.site_id);
-      const range = localRange(a.start_date, a.end_date, tz);
-      const rows = clipToRange(
-        (await amberGet(`/sites/${id}/prices`, {
-          startDate: range.nemStart,
-          endDate: range.nemEnd,
-          resolution: a.resolution,
-        })) as Row[],
-        range,
-      );
-      return { timezone: tz, prices: shapePrices(rows, { channel: a.channel, tz, aggregate: a.aggregate, detail: a.detail, fields: a.fields }) };
+      const { rows, failed, chunkCount } = await fetchWindowed(amberGet, `/sites/${id}/prices`, { resolution: a.resolution }, {
+        start: a.start_date,
+        end: a.end_date,
+        tz,
+        maxDays: PRICES_MAX_CHUNK_DAYS,
+        startedAt,
+      });
+      return {
+        timezone: tz,
+        prices: shapePrices(rows, { channel: a.channel, tz, aggregate: a.aggregate, detail: a.detail, fields: a.fields }),
+        ...(failed.length ? { warnings: [failureWarning(failed, chunkCount)], failedRanges: failed } : {}),
+      };
     }),
   );
 
@@ -360,7 +423,7 @@ export function buildServer(auth: AuthContext): McpServer {
     "get_usage",
     {
       description:
-        "Consumption and cost between two local dates, inclusive (max ~90 days); the range is aligned to local midnights. Always returns per-channel totals (kWh, cost) and a data-quality section flagging all-zero channels and suspected meter gaps. Zero-kWh rows are dropped unless include_zero=true.",
+        "Consumption and cost between two local dates, inclusive; the range is aligned to local midnights. Maximum range is 90 days; ranges over 7 days are fetched in 7-day chunks and merged into one response (slower, so prefer totals_only or aggregate=daily for long ranges). Always returns per-channel totals (kWh, cost) and a data-quality section: dataFrom, dataThrough, missingDays (requested dates with no data), suspected meter gaps, and failedRanges if any chunk failed. Zero-kWh rows are dropped unless include_zero=true.",
       inputSchema: {
         site_id: siteId,
         start_date: date,
@@ -376,17 +439,17 @@ export function buildServer(auth: AuthContext): McpServer {
     },
     wrap(async (a) => {
       noFieldsWithAggregate(a.fields, a.aggregate);
+      const startedAt = Date.now();
       const tz = tzOf(a.timezone);
-      const days = (Date.parse(a.end_date) - Date.parse(a.start_date)) / 86_400_000;
-      if (days < 0) throw new AmberError("end_date is before start_date");
-      const range = localRange(a.start_date, a.end_date, tz);
-      if ((Date.parse(range.nemEnd) - Date.parse(range.nemStart)) / 86_400_000 >= 90)
-        throw new AmberError("Amber limits usage queries to 90 days (the range is widened by a day at the start in daylight-saving time; use 89 days or fewer)");
+      checkRange(a.start_date, a.end_date);
       const id = await resolveSite(a.site_id);
-      const rows = clipToRange(
-        (await amberGet(`/sites/${id}/usage`, { startDate: range.nemStart, endDate: range.nemEnd })) as Row[],
-        range,
-      );
+      const { rows, failed, chunkCount } = await fetchWindowed(amberGet, `/sites/${id}/usage`, {}, {
+        start: a.start_date,
+        end: a.end_date,
+        tz,
+        maxDays: USAGE_MAX_CHUNK_DAYS,
+        startedAt,
+      });
       return shapeUsage(rows, {
         channel: a.channel,
         tz,
@@ -395,6 +458,9 @@ export function buildServer(auth: AuthContext): McpServer {
         totalsOnly: a.totals_only,
         gapRun: a.gap_threshold_intervals,
         fields: a.fields,
+        requested: { start: a.start_date, end: a.end_date },
+        failed,
+        chunkCount,
       });
     }),
   );
