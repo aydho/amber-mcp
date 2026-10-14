@@ -1,43 +1,49 @@
-import { createHmac, createHash, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
-const ACCESS_TTL_S = 60 * 60;
-const REFRESH_TTL_S = 30 * 24 * 60 * 60;
+const ACCESS_TTL_S = 30 * 24 * 60 * 60;
 const CODE_TTL_S = 5 * 60;
+const AMBER = "https://api.amber.com.au/v1";
 
-const secret = () => {
-  const s = process.env.MCP_SHARED_SECRET;
-  if (!s) throw new Error("MCP_SHARED_SECRET is not configured");
-  return s;
+const aesKey = () => {
+  const s = process.env.KEY_ENCRYPTION_SECRET;
+  if (!s) throw new Error("KEY_ENCRYPTION_SECRET is not configured");
+  return createHash("sha256").update("amber-mcp:" + s).digest();
 };
 
-const b64u = (b: Buffer | string) => Buffer.from(b).toString("base64url");
-const mac = (data: string) => createHmac("sha256", "oauth:" + secret()).update(data).digest("base64url");
-
-function safeEq(a: string, b: string): boolean {
-  const x = Buffer.from(a);
-  const y = Buffer.from(b);
-  return x.length === y.length && timingSafeEqual(x, y);
+/** Encrypted + authenticated stateless token (AES-256-GCM). The Amber API key travels inside it. */
+export function seal(payload: Record<string, unknown>, ttlS: number): string {
+  const iv = randomBytes(12);
+  const c = createCipheriv("aes-256-gcm", aesKey(), iv);
+  const data = Buffer.concat([
+    c.update(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + ttlS })),
+    c.final(),
+  ]);
+  return Buffer.concat([iv, c.getAuthTag(), data]).toString("base64url");
 }
 
-/** Stateless signed token: base64url(json).hmac */
-export function sign(payload: Record<string, unknown>, ttlS: number): string {
-  const body = b64u(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + ttlS }));
-  return `${body}.${mac(body)}`;
-}
-
-export function verify(token: string, typ: string): Record<string, any> | null {
-  const [body, sig] = token.split(".");
-  if (!body || !sig || !safeEq(sig, mac(body))) return null;
+export function open(token: string, typ: string): Record<string, any> | null {
   try {
-    const p = JSON.parse(Buffer.from(body, "base64url").toString());
+    const buf = Buffer.from(token, "base64url");
+    const d = createDecipheriv("aes-256-gcm", aesKey(), buf.subarray(0, 12));
+    d.setAuthTag(buf.subarray(12, 28));
+    const p = JSON.parse(Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString());
     return p.typ === typ && p.exp > Date.now() / 1000 ? p : null;
   } catch {
     return null;
   }
 }
 
-export const isSharedSecret = (given: string) => safeEq(given, secret());
-export const validAccessToken = (t: string) => verify(t, "access") !== null;
+/** Amber API key from an OAuth access token, or null. */
+export const keyFromAccessToken = (t: string): string | null => open(t, "access")?.k ?? null;
+
+export async function amberKeyValid(key: string): Promise<boolean> {
+  try {
+    const r = await fetch(AMBER + "/sites", { headers: { Authorization: `Bearer ${key}` } });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -66,7 +72,7 @@ export function authServerMetadata(req: Request) {
     token_endpoint: o + "/token",
     registration_endpoint: o + "/register",
     response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code", "refresh_token"],
+    grant_types_supported: ["authorization_code"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
   });
@@ -81,7 +87,7 @@ const redirectOk = (u: string) => {
   }
 };
 
-/** Dynamic client registration; client_id is a signed copy of the redirect URIs so nothing is stored. */
+/** Dynamic client registration; client_id is a sealed copy of the redirect URIs so nothing is stored. */
 export async function register(req: Request) {
   let body: any;
   try {
@@ -92,13 +98,12 @@ export async function register(req: Request) {
   const uris: unknown = body.redirect_uris;
   if (!Array.isArray(uris) || !uris.length || !uris.every((u) => typeof u === "string" && redirectOk(u)))
     return oauthError("invalid_redirect_uri", "redirect_uris must be https (or localhost) URLs");
-  const client_id = sign({ typ: "client", uris }, 10 * 365 * 24 * 3600);
   return json(
     {
-      client_id,
+      client_id: seal({ typ: "client", uris }, 10 * 365 * 24 * 3600),
       client_name: body.client_name,
       redirect_uris: uris,
-      grant_types: ["authorization_code", "refresh_token"],
+      grant_types: ["authorization_code"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
     },
@@ -109,7 +114,7 @@ export async function register(req: Request) {
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 function authorizeParams(p: URLSearchParams) {
-  const client = verify(p.get("client_id") ?? "", "client");
+  const client = open(p.get("client_id") ?? "", "client");
   const redirect_uri = p.get("redirect_uri") ?? "";
   if (!client || !client.uris.includes(redirect_uri)) return null;
   if (p.get("response_type") !== "code" || p.get("code_challenge_method") !== "S256" || !p.get("code_challenge"))
@@ -129,22 +134,23 @@ const page = (body: string, status = 200) =>
     { status, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } },
   );
 
+const form = (search: string, error = "") => `<h2>Connect to Amber MCP</h2>${error}
+<p>Enter your Amber API key. It is checked against Amber, then encrypted into a token that expires in 30 days. It is not stored on the server.</p>
+<form method="post" action="/authorize${esc(search)}">
+<input type="password" name="api_key" autofocus required style="width:100%;padding:.5rem;margin:.5rem 0">
+<button style="padding:.5rem 1rem">Connect</button></form>`;
+
 export async function authorize(req: Request) {
   const url = new URL(req.url);
-  if (req.method === "GET") {
-    const a = authorizeParams(url.searchParams);
-    if (!a) return page("<p>Invalid authorization request.</p>", 400);
-    return page(`<h2>Connect to Amber MCP</h2><p>Enter your MCP shared secret to approve this connection.</p>
-<form method="post" action="/authorize${esc(url.search)}">
-<input type="password" name="secret" autofocus required style="width:100%;padding:.5rem;margin:.5rem 0">
-<button style="padding:.5rem 1rem">Approve</button></form>`);
-  }
   const a = authorizeParams(url.searchParams);
   if (!a) return page("<p>Invalid authorization request.</p>", 400);
-  const form = await req.formData();
-  if (!isSharedSecret(String(form.get("secret") ?? ""))) return page("<p>Wrong secret. Go back and try again.</p>", 403);
-  const code = sign(
-    { typ: "code", client_id: a.client_id, redirect_uri: a.redirect_uri, cc: a.code_challenge },
+  if (req.method === "GET") return page(form(url.search));
+
+  const apiKey = String((await req.formData()).get("api_key") ?? "").trim();
+  if (!apiKey || !(await amberKeyValid(apiKey)))
+    return page(form(url.search, "<p style='color:#b00'>Amber rejected that API key.</p>"), 403);
+  const code = seal(
+    { typ: "code", client_id: a.client_id, redirect_uri: a.redirect_uri, cc: a.code_challenge, k: apiKey },
     CODE_TTL_S,
   );
   const dest = new URL(a.redirect_uri);
@@ -153,30 +159,20 @@ export async function authorize(req: Request) {
   return Response.redirect(dest.toString(), 302);
 }
 
-const tokens = () => ({
-  access_token: sign({ typ: "access" }, ACCESS_TTL_S),
-  token_type: "Bearer",
-  expires_in: ACCESS_TTL_S,
-  refresh_token: sign({ typ: "refresh" }, REFRESH_TTL_S),
-});
-
 export async function token(req: Request) {
-  const form = new URLSearchParams(await req.text());
-  const grant = form.get("grant_type");
-  if (grant === "authorization_code") {
-    const c = verify(form.get("code") ?? "", "code");
-    const verifier = form.get("code_verifier") ?? "";
-    if (!c) return oauthError("invalid_grant", "Invalid or expired code");
-    if (c.client_id !== form.get("client_id") || c.redirect_uri !== form.get("redirect_uri"))
-      return oauthError("invalid_grant", "Client or redirect_uri mismatch");
-    if (!safeEq(createHash("sha256").update(verifier).digest("base64url"), c.cc))
-      return oauthError("invalid_grant", "PKCE verification failed");
-    return json(tokens());
-  }
-  if (grant === "refresh_token") {
-    if (!verify(form.get("refresh_token") ?? "", "refresh"))
-      return oauthError("invalid_grant", "Invalid or expired refresh token");
-    return json(tokens());
-  }
-  return oauthError("unsupported_grant_type");
+  const f = new URLSearchParams(await req.text());
+  if (f.get("grant_type") !== "authorization_code") return oauthError("unsupported_grant_type");
+  const c = open(f.get("code") ?? "", "code");
+  if (!c) return oauthError("invalid_grant", "Invalid or expired code");
+  if (c.client_id !== f.get("client_id") || c.redirect_uri !== f.get("redirect_uri"))
+    return oauthError("invalid_grant", "Client or redirect_uri mismatch");
+  const challenge = Buffer.from(createHash("sha256").update(f.get("code_verifier") ?? "").digest("base64url"));
+  const expected = Buffer.from(c.cc);
+  if (challenge.length !== expected.length || !timingSafeEqual(challenge, expected))
+    return oauthError("invalid_grant", "PKCE verification failed");
+  return json({
+    access_token: seal({ typ: "access", k: c.k }, ACCESS_TTL_S),
+    token_type: "Bearer",
+    expires_in: ACCESS_TTL_S,
+  });
 }
