@@ -4,7 +4,7 @@ import { AmberError, amberClient } from "./amber.js";
 import { amberKeyValid } from "./oauth.js";
 import { DEFAULT_TZ, STATE_TZ, checkTz, clipToRange, localDay, localRange, localHour, parseTime, pick, round, toLocal } from "./format.js";
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.5.1";
 
 export interface AuthContext {
   apiKey: string;
@@ -25,7 +25,7 @@ const detail = z
   .enum(["compact", "full"])
   .default("compact")
   .describe(
-    "compact: key fields plus spikeStatus (only when not 'none') and forecast low/high; full: also spotPerKwh, descriptor, forecast predicted, tariff period",
+    "compact: key fields plus spikeStatus (only when not 'none') and Amber's forecast model values (forecastLow/Predicted/High); full: also spotPerKwh, descriptor, tariff period",
   );
 const aggregate = z
   .enum(["none", "hourly", "daily"])
@@ -58,9 +58,9 @@ const matches = (r: Row, ch: string) => ch === "all" || r.channelType === ch;
 const byStart = (a: Row, b: Row) => String(a.startTime).localeCompare(String(b.startTime));
 const kind = (t: string) => (t === "ActualInterval" ? "actual" : t === "CurrentInterval" ? "current" : "forecast");
 
-const PRICE_FIELDS = ["start", "end", "channel", "type", "perKwh", "spotPerKwh", "renewables", "descriptor", "spikeStatus", "low", "predicted", "high", "tariffPeriod"] as const;
-const PRICE_DEFAULT = ["start", "end", "channel", "type", "perKwh", "renewables", "spikeStatus", "low", "high"];
-const PRICE_FULL = [...PRICE_DEFAULT, "spotPerKwh", "descriptor", "predicted", "tariffPeriod"];
+const PRICE_FIELDS = ["start", "end", "channel", "type", "perKwh", "spotPerKwh", "renewables", "descriptor", "spikeStatus", "forecastLow", "forecastPredicted", "forecastHigh", "tariffPeriod"] as const;
+const PRICE_DEFAULT = ["start", "end", "channel", "type", "perKwh", "renewables", "spikeStatus", "forecastLow", "forecastPredicted", "forecastHigh"];
+const PRICE_FULL = [...PRICE_DEFAULT, "spotPerKwh", "descriptor", "tariffPeriod"];
 
 function shapePrices(rows: Row[], o: { channel: string; tz: string; aggregate: string; detail: string; fields?: readonly string[] }) {
   const list = rows.filter((r) => matches(r, o.channel)).sort(byStart);
@@ -77,16 +77,16 @@ function shapePrices(rows: Row[], o: { channel: string; tz: string; aggregate: s
         renewables: round(r.renewables, 1),
         descriptor: r.descriptor,
         spikeStatus: r.spikeStatus,
-        low: round(adv.low),
-        predicted: round(adv.predicted),
-        high: round(adv.high),
+        forecastLow: round(adv.low),
+        forecastPredicted: round(adv.predicted),
+        forecastHigh: round(adv.high),
         tariffPeriod: r.tariffInformation?.period,
       };
       const out = pick(row, o.fields ?? (o.detail === "full" ? PRICE_FULL : PRICE_DEFAULT)) as Row;
       // sparse by default: drop spikeStatus "none" and absent forecast bands unless explicitly requested
       if (!o.fields) {
         if (out.spikeStatus === "none" || out.spikeStatus == null) delete out.spikeStatus;
-        for (const k of ["low", "high", "predicted"]) if (out[k] == null) delete out[k];
+        for (const k of ["forecastLow", "forecastPredicted", "forecastHigh"]) if (out[k] == null) delete out[k];
       }
       return out;
     });
@@ -269,13 +269,16 @@ export function buildServer(auth: AuthContext): McpServer {
     {
       description:
         "Read-only check of the connection: auth method, when the token expires and days remaining. Never reveals the API key.",
-      inputSchema: { check_with_amber: z.boolean().default(false).describe("Also confirm Amber still accepts the key") },
+      inputSchema: { check_with_amber: z.boolean().default(false).describe("Also confirm Amber still accepts the key"), timezone },
     },
-    wrap(async ({ check_with_amber }) => {
+    wrap(async ({ check_with_amber, timezone: tzArg }) => {
+      const tz = tzOf(tzArg);
       const out: Row = { serverVersion: VERSION, authenticated: true, method: auth.method };
       if (auth.expiresAt) {
         const days = (auth.expiresAt - Date.now()) / 86_400_000;
-        out.expiresAt = new Date(auth.expiresAt).toISOString();
+        out.timezone = tz;
+        out.expiresAt = toLocal(new Date(auth.expiresAt).toISOString(), tz);
+        out.expiresAtUtc = new Date(auth.expiresAt).toISOString();
         out.daysRemaining = round(days, 1);
         if (days < 3) out.warning = "Token expires soon; reconnect the connector to enter your key again.";
       } else out.expiresAt = null;
@@ -294,7 +297,7 @@ export function buildServer(auth: AuthContext): McpServer {
     "get_current_prices",
     {
       description:
-        "Current price per channel on your site in c/kWh (2dp), optionally with forecast and past intervals. Includes spikeStatus (when not 'none') and forecast low/high bands; detail=full adds spot price, descriptor and predicted. Times are local with correct DST offsets.",
+        "Current price per channel on your site in c/kWh (2dp), optionally with forecast and past intervals. Includes spikeStatus (when not 'none') and Amber's forecast model values forecastLow/Predicted/High, which come from a separate model and need not bracket perKwh; detail=full adds spot price, descriptor and tariff period. Times are local with correct DST offsets.",
       inputSchema: {
         site_id: siteId,
         channel,

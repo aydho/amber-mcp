@@ -8,7 +8,7 @@ Remote MCP server for the [Amber Electric API](https://api.amber.com.au/v1), Typ
 - Date ranges (`start_date`/`end_date`) are local calendar days. Amber itself takes NEM-time (fixed UTC+10) days, so the server requests the covering NEM days and clips to local midnights, which keeps daily buckets complete in daylight saving.
 - Tool schemas list only the channels on your account (looked up on `tools/list`).
 - Times are returned in local time with the real DST offset (`timezone` param; default `Australia/Melbourne`, override with the `DEFAULT_TIMEZONE` env var). Amber's `:00:01` interval starts are trimmed.
-- Prices: compact by default (adds `spikeStatus` when not `none`, plus forecast `low`/`high`); `detail=full` adds spot price, descriptor, predicted and tariff period.
+- Prices: compact by default (adds `spikeStatus` when not `none`, plus `forecastLow`/`forecastPredicted`/`forecastHigh` (Amber's separate forecast model; may not bracket `perKwh`)); `detail=full` adds spot price, descriptor and tariff period.
 - Prices/usage: `channel` filter, `aggregate` (hourly/daily), `fields` selection, rounded numbers. `get_usage` drops zero-kWh rows (`include_zero` to keep), returns per-channel kWh/cost totals (`totals_only` for just those) and a `dataQuality` block flagging all-zero channels and suspected meter gaps (`gap_threshold_intervals`, default 3 = 1.5h; marks gaps in the 16:00-21:00 peak and at the end of the data).
 - `find_cheapest_window`: `load_kw` cost estimate, `finish_by` deadline, next-best non-overlapping `alternatives`, optional per-interval prices.
 
