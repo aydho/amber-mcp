@@ -4,7 +4,7 @@ import { AmberError, amberClient } from "./amber.js";
 import { amberKeyValid } from "./oauth.js";
 import { DEFAULT_TZ, STATE_TZ, checkTz, clipToRange, localDay, localRange, localHour, parseTime, pick, round, toLocal } from "./format.js";
 
-export const VERSION = "0.5.1";
+export const VERSION = "0.5.2";
 
 export interface AuthContext {
   apiKey: string;
@@ -30,7 +30,7 @@ const detail = z
 const aggregate = z
   .enum(["none", "hourly", "daily"])
   .default("none")
-  .describe("Collapse intervals into hourly or daily buckets (local time) to shrink the response");
+  .describe("Collapse intervals into hourly or daily buckets (local time) to shrink the response. Buckets have a fixed shape, so fields (and detail) do not apply");
 
 const ok = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }] });
 const fail = (e: unknown) => ({
@@ -46,6 +46,11 @@ const wrap =
       return fail(e);
     }
   };
+
+const noFieldsWithAggregate = (fields: unknown, aggregate: string) => {
+  if (fields !== undefined && aggregate !== "none")
+    throw new AmberError('"fields" only applies when aggregate="none"; aggregated buckets have a fixed shape. Drop fields or set aggregate="none".');
+};
 
 const tzOf = (tz?: string, fallback = DEFAULT_TZ) => {
   const z = tz ?? fallback;
@@ -306,10 +311,11 @@ export function buildServer(auth: AuthContext): McpServer {
         aggregate,
         detail,
         timezone,
-        fields: z.array(z.enum(PRICE_FIELDS)).optional().describe(`Explicit field list; overrides detail (default: ${PRICE_DEFAULT.join(", ")})`),
+        fields: z.array(z.enum(PRICE_FIELDS)).optional().describe(`Explicit field list; overrides detail. Only valid with aggregate="none" (default: ${PRICE_DEFAULT.join(", ")})`),
       },
     },
     wrap(async (a) => {
+      noFieldsWithAggregate(a.fields, a.aggregate);
       const tz = tzOf(a.timezone);
       const id = await resolveSite(a.site_id);
       const rows = (await amberGet(`/sites/${id}/prices/current`, { next: a.next, previous: a.previous, resolution: 30 })) as Row[];
@@ -330,10 +336,11 @@ export function buildServer(auth: AuthContext): McpServer {
         aggregate,
         detail,
         timezone,
-        fields: z.array(z.enum(PRICE_FIELDS)).optional().describe(`Explicit field list; overrides detail (default: ${PRICE_DEFAULT.join(", ")})`),
+        fields: z.array(z.enum(PRICE_FIELDS)).optional().describe(`Explicit field list; overrides detail. Only valid with aggregate="none" (default: ${PRICE_DEFAULT.join(", ")})`),
       },
     },
     wrap(async (a) => {
+      noFieldsWithAggregate(a.fields, a.aggregate);
       const tz = tzOf(a.timezone);
       const id = await resolveSite(a.site_id);
       const range = localRange(a.start_date, a.end_date, tz);
@@ -364,10 +371,11 @@ export function buildServer(auth: AuthContext): McpServer {
         totals_only: z.boolean().default(false).describe("Return only totals and data quality, no rows"),
         include_zero: z.boolean().default(false).describe("Keep zero-kWh rows"),
         timezone,
-        fields: z.array(z.enum(USAGE_FIELDS)).optional().describe(`Row fields (default: ${USAGE_DEFAULT.join(", ")})`),
+        fields: z.array(z.enum(USAGE_FIELDS)).optional().describe(`Row fields; only valid with aggregate="none" (default: ${USAGE_DEFAULT.join(", ")})`),
       },
     },
     wrap(async (a) => {
+      noFieldsWithAggregate(a.fields, a.aggregate);
       const tz = tzOf(a.timezone);
       const days = (Date.parse(a.end_date) - Date.parse(a.start_date)) / 86_400_000;
       if (days < 0) throw new AmberError("end_date is before start_date");
