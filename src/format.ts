@@ -93,3 +93,24 @@ export function pick<T extends Record<string, unknown>>(row: T, fields: readonly
 export function checkTz(tz: string) {
   dtf(tz);
 }
+
+const NEM_OFFSET_MS = 10 * 3_600_000;
+const nemDate = (ms: number) => new Date(ms + NEM_OFFSET_MS).toISOString().slice(0, 10);
+const nextDay = (d: string) => new Date(Date.parse(d + "T00:00:00Z") + 86_400_000).toISOString().slice(0, 10);
+
+/**
+ * Amber's startDate/endDate are NEM-time (fixed UTC+10) days. For a local-date range, return the NEM days to request
+ * plus the exact local-midnight window [fromMs, toMs) to clip the response to.
+ */
+export function localRange(startDate: string, endDate: string, tz: string) {
+  const fromMs = parseTime(`${startDate}T00:00`, tz);
+  const toMs = parseTime(`${nextDay(endDate)}T00:00`, tz);
+  return { fromMs, toMs, nemStart: nemDate(fromMs), nemEnd: nemDate(toMs - 1) };
+}
+
+export function clipToRange<T extends { startTime?: any }>(rows: T[], r: { fromMs: number; toMs: number }): T[] {
+  return rows.filter((x) => {
+    const t = roundMin(String(x.startTime));
+    return t >= r.fromMs && t < r.toMs;
+  });
+}

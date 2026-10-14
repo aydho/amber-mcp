@@ -2,23 +2,21 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { AmberError, amberClient } from "./amber.js";
 import { amberKeyValid } from "./oauth.js";
-import { DEFAULT_TZ, STATE_TZ, checkTz, localDay, localHour, parseTime, pick, round, toLocal } from "./format.js";
+import { DEFAULT_TZ, STATE_TZ, checkTz, clipToRange, localDay, localRange, localHour, parseTime, pick, round, toLocal } from "./format.js";
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 
 export interface AuthContext {
   apiKey: string;
   method: "oauth" | "api_key";
   /** epoch ms; absent for raw API-key bearers */
   expiresAt?: number;
+  /** channel types present on the account (general, controlledLoad, feedIn); used to tailor tool schemas */
+  channels?: string[];
 }
 
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD");
 const siteId = z.string().optional().describe("Amber site id; defaults to the only site on the account");
-const channel = z
-  .enum(["all", "general", "controlledLoad", "feedIn"])
-  .default("all")
-  .describe("Filter to one channel. Only channels on your site are returned (general = buy; controlledLoad and feedIn exist only if you have them)");
 const timezone = z
   .string()
   .optional()
@@ -245,7 +243,26 @@ function shapeUsage(
 
 export function buildServer(auth: AuthContext): McpServer {
   const { get: amberGet, resolveSite } = amberClient(auth.apiKey);
-  const server = new McpServer({ name: "amber-mcp", version: VERSION });
+  const server = new McpServer(
+    {
+      name: "amber-mcp",
+      title: "Amber Electric",
+      version: VERSION,
+      description: "Amber Electric prices, usage, renewables and cheapest-window finder for your Amber account.",
+    },
+    {
+      instructions:
+        "Tools for the Amber Electric API. Times are returned in local time (default Australia/Melbourne; set timezone to change). Prices are c/kWh. Prefer channel and aggregate=hourly|daily to keep responses small, and check get_usage's dataQuality block before trusting zero-usage periods.",
+    },
+  );
+  const present = auth.channels?.length ? auth.channels : ["general", "controlledLoad", "feedIn"];
+  const channel = z
+    .enum(["all", ...present] as [string, ...string[]])
+    .default("all")
+    .describe(
+      `Filter to one channel. Channels on your account: ${present.join(", ")} (general = buy${present.includes("controlledLoad") ? ", controlledLoad = off-peak" : ""}${present.includes("feedIn") ? ", feedIn = solar export" : ""})`,
+    );
+  const windowChannels = present.filter((c) => c !== "feedIn") as [string, ...string[]];
 
   server.registerTool(
     "get_auth_status",
@@ -300,7 +317,7 @@ export function buildServer(auth: AuthContext): McpServer {
   server.registerTool(
     "get_price_history",
     {
-      description: "Historical prices between two dates (inclusive), c/kWh. Default is ~48 rows per channel per day; use channel and aggregate=hourly|daily to shrink it.",
+      description: "Historical prices between two local dates (inclusive, aligned to local midnights), c/kWh. Default is ~48 rows per channel per day; use channel and aggregate=hourly|daily to shrink it.",
       inputSchema: {
         site_id: siteId,
         start_date: date,
@@ -316,11 +333,15 @@ export function buildServer(auth: AuthContext): McpServer {
     wrap(async (a) => {
       const tz = tzOf(a.timezone);
       const id = await resolveSite(a.site_id);
-      const rows = (await amberGet(`/sites/${id}/prices`, {
-        startDate: a.start_date,
-        endDate: a.end_date,
-        resolution: a.resolution,
-      })) as Row[];
+      const range = localRange(a.start_date, a.end_date, tz);
+      const rows = clipToRange(
+        (await amberGet(`/sites/${id}/prices`, {
+          startDate: range.nemStart,
+          endDate: range.nemEnd,
+          resolution: a.resolution,
+        })) as Row[],
+        range,
+      );
       return { timezone: tz, prices: shapePrices(rows, { channel: a.channel, tz, aggregate: a.aggregate, detail: a.detail, fields: a.fields }) };
     }),
   );
@@ -329,7 +350,7 @@ export function buildServer(auth: AuthContext): McpServer {
     "get_usage",
     {
       description:
-        "Consumption/generation and cost between two dates (max 90 days). Always returns per-channel totals (kWh, cost) and a data-quality section flagging all-zero channels and suspected meter gaps. Zero-kWh rows are dropped unless include_zero=true.",
+        "Consumption and cost between two local dates, inclusive (max ~90 days); the range is aligned to local midnights. Always returns per-channel totals (kWh, cost) and a data-quality section flagging all-zero channels and suspected meter gaps. Zero-kWh rows are dropped unless include_zero=true.",
       inputSchema: {
         site_id: siteId,
         start_date: date,
@@ -347,9 +368,14 @@ export function buildServer(auth: AuthContext): McpServer {
       const tz = tzOf(a.timezone);
       const days = (Date.parse(a.end_date) - Date.parse(a.start_date)) / 86_400_000;
       if (days < 0) throw new AmberError("end_date is before start_date");
-      if (days > 90) throw new AmberError("Amber limits usage queries to 90 days");
+      const range = localRange(a.start_date, a.end_date, tz);
+      if ((Date.parse(range.nemEnd) - Date.parse(range.nemStart)) / 86_400_000 >= 90)
+        throw new AmberError("Amber limits usage queries to 90 days (the range is widened by a day at the start in daylight-saving time; use 89 days or fewer)");
       const id = await resolveSite(a.site_id);
-      const rows = (await amberGet(`/sites/${id}/usage`, { startDate: a.start_date, endDate: a.end_date })) as Row[];
+      const rows = clipToRange(
+        (await amberGet(`/sites/${id}/usage`, { startDate: range.nemStart, endDate: range.nemEnd })) as Row[],
+        range,
+      );
       return shapeUsage(rows, {
         channel: a.channel,
         tz,
@@ -402,7 +428,7 @@ export function buildServer(auth: AuthContext): McpServer {
         site_id: siteId,
         duration_hours: z.number().min(0.5).max(24).describe("Length of the block (0.5h steps)"),
         within_hours: z.number().min(1).max(48).default(24).describe("Search horizon from now"),
-        channel: z.enum(["general", "controlledLoad"]).default("general"),
+        channel: z.enum(windowChannels.length ? windowChannels : ["general"]).default("general"),
         load_kw: z.number().positive().optional().describe("Average load in kW; adds an estimated cost"),
         finish_by: z
           .string()
