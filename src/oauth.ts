@@ -33,8 +33,13 @@ export function open(token: string, typ: string): Record<string, any> | null {
   }
 }
 
-/** Amber API key from an OAuth access token, or null. */
-export const keyFromAccessToken = (t: string): string | null => open(t, "access")?.k ?? null;
+/** Amber API key and expiry (epoch seconds) from an OAuth access token, or null. */
+export function parseAccessToken(t: string): { key: string; exp: number } | null {
+  const p = open(t, "access");
+  return p ? { key: p.k, exp: p.exp } : null;
+}
+
+export const keyFromAccessToken = (t: string): string | null => parseAccessToken(t)?.key ?? null;
 
 export async function amberKeyValid(key: string): Promise<boolean> {
   try {
