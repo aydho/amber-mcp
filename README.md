@@ -14,7 +14,10 @@ The Amber key is AES-GCM encrypted and kept in Netlify Blobs with a hard 60-minu
    - `KEY_ENCRYPTION_SECRET`: a different long random string.
 3. Deploy.
 
-## Claude Desktop
+## claude.ai (custom connector)
+Settings > Connectors > Add custom connector, URL `https://YOUR-SITE.netlify.app/mcp`. The server implements OAuth (dynamic client registration + PKCE); when the approval page opens, enter `MCP_SHARED_SECRET`. Access tokens last 1h, refresh tokens 30 days, all HMAC-signed and stateless.
+
+## Claude Desktop (via mcp-remote)
 Add to `claude_desktop_config.json` (needs Node):
 
 ```json
