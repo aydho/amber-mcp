@@ -1,11 +1,12 @@
 {
   "name": "amber-mcp",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "dev": "netlify dev"
+    "dev": "netlify dev",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
@@ -14,6 +15,7 @@
   "devDependencies": {
     "@netlify/functions": "^6.0.2",
     "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
 }
